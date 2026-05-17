@@ -1,0 +1,27 @@
+# Virtual environment
+.venv/
+
+# Data (too large for git)
+data/raw/
+data/processed/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Checkpoints
+checkpoints/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Weights & Biases
+wandb/
+
+# Environment variables
+.env
+
+# OS
+.DS_Store
