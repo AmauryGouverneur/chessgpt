@@ -62,6 +62,7 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             base ** (torch.arange(0, head_size, 2).float() / head_size)
         )
+        self.inv_freq: torch.Tensor
         self.register_buffer("inv_freq", inv_freq)
 
     def forward(self, T: int, device: torch.device):
@@ -98,6 +99,7 @@ class AttentionHead(nn.Module):
     def __init__(self, config: ChessGPTConfig):
         super().__init__()
         self.dropout = nn.Dropout(config.dropout)
+        self.tril: torch.Tensor
         self.register_buffer(
             "tril",
             torch.tril(torch.ones(config.block_size, config.block_size)),
