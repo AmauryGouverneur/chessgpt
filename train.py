@@ -99,7 +99,6 @@ def save_config(run_dir: Path, config: ChessGPTConfig, args: argparse.Namespace)
             "n_embd":      config.n_embd,
             "n_layer":     config.n_layer,
             "n_head":      config.n_head,
-            "n_kv_head":   config.n_kv_head,
             "dropout":     config.dropout,
         }, f, indent=2)
 
@@ -168,7 +167,6 @@ def train(args: argparse.Namespace) -> None:
             "n_embd":        config.n_embd,
             "n_layer":       config.n_layer,
             "n_head":        config.n_head,
-            "n_kv_head":     config.n_kv_head,
             "dropout":       config.dropout,
             "max_steps":     max_steps,
             "warmup_steps":  warmup_steps,
