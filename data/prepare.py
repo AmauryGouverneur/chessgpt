@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-prepare.py — filter and tokenize Lichess PGN games in a single pass.
+prepare.py — filter and tokenize Lichess PGN games into curriculum phases.
 
 Usage:
-    python data/prepare.py --input data/raw/lichess_mini.pgn.zst \
-                           --output data/processed/dataset_mini_moves.parquet
-    python data/prepare.py --input data/raw/lichess_mini.pgn.zst \
-                           --output data/processed/dataset_mini_moves.parquet \
-                           --debug
+    python data/prepare.py \
+        --input data/raw/lichess_db_standard_rated_2025-01.pgn.zst \
+        --output-dir data/processed/ \
+        --debug
 """
 
 import argparse
 import re
 import os
-import sys
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Iterator
@@ -23,11 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import (
-    PIECES, TOKEN2ID, ID2TOKEN, VOCAB_SIZE,
-    WIN_ID, DRAW_ID, LOSS_ID, GAME_END_ID, PROMOTION_ID,
-)
+from config import PHASES, TOKEN2ID, UNK_ID, VOCAB_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -50,98 +44,71 @@ def parse_elo(val: str) -> int:
         return 0
 
 
-def result_to_token(val: str) -> int | None:
-    return {"1-0": WIN_ID, "0-1": LOSS_ID, "1/2-1/2": DRAW_ID}.get(val)
+def parse_result(val: str) -> str | None:
+    return {"1-0": "1-0", "0-1": "0-1", "1/2-1/2": "1/2-1/2"}.get(val)
 
 
 # ---------------------------------------------------------------------------
-# Tokenizer
+# Text encoding
 # ---------------------------------------------------------------------------
 
-def tokenize_move(san: str) -> list[int]:
+def encode(text: str) -> list[int]:
+    """Encode a string to token ids using the ASCII vocabulary."""
+    return [TOKEN2ID.get(c, UNK_ID) for c in text]
+
+
+# ---------------------------------------------------------------------------
+# Game text construction
+# ---------------------------------------------------------------------------
+
+def truncate_moves(moves_str: str, max_moves: int) -> str:
     """
-    Convert a single SAN move string to a list of token ids.
-
-    Examples:
-        e4      -> [e][4]
-        Nf3     -> [N][f][3]
-        Nxf3    -> [N][x][f][3]
-        O-O     -> [O-O]
-        O-O-O   -> [O-O-O]
-        e8=Q    -> [e][8][PROMOTION]
-        Nf3+    -> [N][f][3][+]
-        Qh7#    -> [Q][h][7][#]
+    Truncate a move string to at most max_moves full moves.
+    e.g. max_moves=3: "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4" -> "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6"
     """
-    san = san.strip().rstrip("?!")
-    ids: list[int] = []
+    # split into tokens, find move number markers
+    tokens  = moves_str.split()
+    result  = []
+    move_count = 0
 
-    if not san:
-        return ids
+    for token in tokens:
+        if re.match(r'^\d+\.$', token):
+            move_count += 1
+            if move_count > max_moves:
+                break
+        if move_count <= max_moves:
+            result.append(token)
 
-    # castling
-    if san.startswith("O-O"):
-        castle = "O-O-O" if san.startswith("O-O-O") else "O-O"
-        ids.append(TOKEN2ID[castle])
-        if san[len(castle):] in ("+", "#"):
-            ids.append(TOKEN2ID[san[len(castle):]])
-        return ids
-
-    # check / mate suffix
-    suffix = ""
-    if san.endswith("+") or san.endswith("#"):
-        suffix, san = san[-1], san[:-1]
-
-    # promotion — collapse all piece choices to [PROMOTION]
-    promotion = False
-    if "=" in san:
-        san       = san[:san.index("=")]
-        promotion = True
-
-    # optional piece
-    i = 0
-    if i < len(san) and san[i] in PIECES:
-        ids.append(TOKEN2ID[san[i]]); i += 1
-
-    # optional capture
-    if i < len(san) and san[i] == "x":
-        ids.append(TOKEN2ID["x"]); i += 1
-
-    # file + rank (destination square, last 2 chars of remaining)
-    remaining = san[i:]
-    if len(remaining) >= 2:
-        file_char = remaining[-2]
-        rank_char = remaining[-1]
-        if file_char in TOKEN2ID and rank_char in TOKEN2ID:
-            ids.append(TOKEN2ID[file_char])
-            ids.append(TOKEN2ID[rank_char])
-
-    if promotion:
-        ids.append(PROMOTION_ID)
-    if suffix:
-        ids.append(TOKEN2ID[suffix])
-
-    return ids
+    return " ".join(result)
 
 
-def tokenize_game(moves_san: str, result_token: int) -> list[int]:
+def build_game_text(
+    white_elo: int,
+    black_elo: int,
+    result:    str,
+    moves_str: str,
+    max_moves: int,
+) -> str:
     """
-    Tokenize a full game into a flat list of token ids.
-    Format: [WIN|DRAW|LOSS] <move tokens> [GAME_END]
+    Build the full text representation of a game.
+    Format: "WhiteElo=XXXX BlackElo=XXXX Result=X-X 1. e4 e5 2. Nf3 ..."
     """
-    moves_san = re.sub(r'\{[^}]*\}', '', moves_san)
-    input_ids = [result_token]
+    moves_san = re.sub(r'\{[^}]*\}', '', moves_str)  # strip annotations
+    moves_san = moves_san.strip()
+    # remove result token at end if present
+    for r in ("1-0", "0-1", "1/2-1/2", "*"):
+        moves_san = moves_san.rstrip()
+        if moves_san.endswith(r):
+            moves_san = moves_san[:-len(r)].rstrip()
 
-    for token in moves_san.split():
-        if re.match(r"^\d+\.+", token):
-            continue
-        if token in {"1-0", "0-1", "1/2-1/2", "*"}:
-            continue
-        ids = tokenize_move(token)
-        if ids:
-            input_ids.extend(ids)
+    truncated = truncate_moves(moves_san, max_moves)
+    header    = f"WhiteElo={white_elo} BlackElo={black_elo} Result={result}"
+    return f"{header} {truncated}"
 
-    input_ids.append(GAME_END_ID)
-    return input_ids
+
+def count_full_moves(moves_str: str) -> int:
+    """Count the number of full moves (move number markers) in a move string."""
+    return len(re.findall(r'\d+\.(?!\d)', moves_str))
 
 
 # ---------------------------------------------------------------------------
@@ -199,112 +166,121 @@ def stream_games(path: str) -> Iterator[RawGame]:
                     yield game
 
 
-def count_plies(moves_str: str) -> int:
-    tokens = [
-        t for t in moves_str.split()
-        if not re.match(r"^\d+\.+", t)
-        and t not in {"1-0", "0-1", "1/2-1/2", "*"}
-    ]
-    return len(tokens)
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input",     required=True)
-    parser.add_argument("--output",    required=True)
-    parser.add_argument("--min-elo",   type=int, default=1200)
-    parser.add_argument("--min-moves", type=int, default=10)
-    parser.add_argument("--debug",     action="store_true")
+    parser.add_argument("--input",      required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--debug",      action="store_true")
     args = parser.parse_args()
 
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
+    # one parquet writer per phase
     schema = pa.schema([
-        ("game_id",   pa.int32()),
         ("white_elo", pa.int16()),
         ("black_elo", pa.int16()),
-        ("result",    pa.int8()),
-        ("n_tokens",  pa.int16()),
-        ("input_ids", pa.list_(pa.int8())),
+        ("n_chars",   pa.int16()),
+        ("text",      pa.string()),
     ])
 
-    min_plies = args.min_moves * 2
-    stats     = {"total": 0, "abandoned": 0, "not_classical": 0,
-                 "low_elo": 0, "too_short": 0, "passed": 0}
-    game_id   = 0
-    rows: list[dict] = []
-    writer    = pq.ParquetWriter(args.output, schema)
+    writers = {
+        phase: pq.ParquetWriter(
+            output_dir / f"dataset_phase{phase}.parquet", schema
+        )
+        for phase in PHASES
+    }
 
-    def flush(rows: list[dict]) -> None:
-        if not rows:
+    rows    = {phase: [] for phase in PHASES}
+    stats   = {
+        "total": 0, "abandoned": 0, "not_classical": 0,
+        "low_elo": 0, "too_short": 0, "passed": 0
+    }
+
+    def flush(phase: int) -> None:
+        if not rows[phase]:
             return
-        writer.write_table(pa.table({
-            "game_id":   pa.array([r["game_id"]   for r in rows], type=pa.int32()),
-            "white_elo": pa.array([r["white_elo"] for r in rows], type=pa.int16()),
-            "black_elo": pa.array([r["black_elo"] for r in rows], type=pa.int16()),
-            "result":    pa.array([r["result"]    for r in rows], type=pa.int8()),
-            "n_tokens":  pa.array([r["n_tokens"]  for r in rows], type=pa.int16()),
-            "input_ids": pa.array([r["input_ids"] for r in rows],
-                                  type=pa.list_(pa.int8())),
+        writers[phase].write_table(pa.table({
+            "white_elo": pa.array([r["white_elo"] for r in rows[phase]], type=pa.int16()),
+            "black_elo": pa.array([r["black_elo"] for r in rows[phase]], type=pa.int16()),
+            "n_chars":   pa.array([r["n_chars"]   for r in rows[phase]], type=pa.int16()),
+            "text":      pa.array([r["text"]       for r in rows[phase]], type=pa.string()),
         }))
+        rows[phase] = []
 
     for raw in stream_games(args.input):
         stats["total"] += 1
 
-        tc           = raw.headers.get("TimeControl", "")
-        welo         = parse_elo(raw.headers.get("WhiteElo", "0"))
-        belo         = parse_elo(raw.headers.get("BlackElo", "0"))
-        result_token = result_to_token(raw.headers.get("Result", ""))
-        n_plies      = count_plies(raw.moves_str)
+        tc       = raw.headers.get("TimeControl", "")
+        welo     = parse_elo(raw.headers.get("WhiteElo", "0"))
+        belo     = parse_elo(raw.headers.get("BlackElo", "0"))
+        result   = parse_result(raw.headers.get("Result", ""))
+        n_moves  = count_full_moves(raw.moves_str)
 
-        if n_plies < 2:                                stats["abandoned"]     += 1; continue
-        if not is_classical(tc):                       stats["not_classical"] += 1; continue
-        if welo < args.min_elo or belo < args.min_elo: stats["low_elo"]       += 1; continue
-        if n_plies < min_plies:                        stats["too_short"]      += 1; continue
-        if result_token is None:                                                      continue
+        if n_moves < 2:
+            stats["abandoned"] += 1; continue
+        if not is_classical(tc):
+            stats["not_classical"] += 1; continue
+        if welo < 1000 or belo < 1000:
+            stats["low_elo"] += 1; continue
+        if n_moves < 10:
+            stats["too_short"] += 1; continue
+        if result is None:
+            continue
 
         stats["passed"] += 1
-        game_id         += 1
-        input_ids        = tokenize_game(raw.moves_str, result_token)
+        min_elo = min(welo, belo)
+        max_elo = max(welo, belo)
 
-        if args.debug:
-            tokens = [ID2TOKEN[i] for i in input_ids]
-            print(f"\n--- Game {game_id} | W:{welo} B:{belo} "
-                  f"R:{ID2TOKEN[result_token]} ---")
-            print(f"  moves    : {raw.moves_str.strip()[:80]}...")
-            print(f"  n_tokens : {len(input_ids)}")
-            print(f"  tokens   : {' '.join(tokens[:16])} ...")
+        for phase, cfg in PHASES.items():
+            if min_elo < cfg["elo_min"] or max_elo > cfg["elo_max"]:
+                continue
 
-        rows.append({
-            "game_id":   game_id,
-            "white_elo": welo,
-            "black_elo": belo,
-            "result":    result_token,
-            "n_tokens":  len(input_ids),
-            "input_ids": input_ids,
-        })
+            text    = build_game_text(welo, belo, result,
+                                      raw.moves_str, cfg["max_moves"])
+            n_chars = len(text)
 
-        if len(rows) >= 1000:
-            flush(rows); rows = []
-        if args.debug and stats["passed"] >= 50:
+            if args.debug:
+                print(f"\n--- Phase {phase} | W:{welo} B:{belo} R:{result} ---")
+                print(f"  text    : {text[:100]}...")
+                print(f"  n_chars : {n_chars}")
+
+            rows[phase].append({
+                "white_elo": welo,
+                "black_elo": belo,
+                "n_chars":   min(n_chars, 32767),
+                "text":      text,
+            })
+
+            if len(rows[phase]) >= 1000:
+                flush(phase)
+
+        if args.debug and stats["passed"] >= 20:
             break
 
-    flush(rows)
-    writer.close()
+    # flush remaining
+    for phase in PHASES:
+        flush(phase)
+        writers[phase].close()
 
     print(f"\n{'='*50}")
     print(f"Total games seen:        {stats['total']:>10,}")
     print(f"  Abandoned:             {stats['abandoned']:>10,}")
     print(f"  Not classical:         {stats['not_classical']:>10,}")
-    print(f"  Elo < {args.min_elo}:          {stats['low_elo']:>10,}")
+    print(f"  Elo < 1000:            {stats['low_elo']:>10,}")
     print(f"  Too short:             {stats['too_short']:>10,}")
-    print(f"  Written to parquet:    {stats['passed']:>10,}")
-    print(f"\nOutput: {args.output}")
-    print(f"Vocab size: {VOCAB_SIZE}")
+    print(f"  Passed:                {stats['passed']:>10,}")
+    print(f"\nOutputs:")
+    for phase in PHASES:
+        path = output_dir / f"dataset_phase{phase}.parquet"
+        if path.exists():
+            size = path.stat().st_size / 1e6
+            print(f"  Phase {phase}: {path.name} ({size:.0f} MB)")
+    print(f"\nVocab size: {VOCAB_SIZE}")
 
 
 if __name__ == "__main__":

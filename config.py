@@ -1,39 +1,51 @@
 # config.py — single source of truth for all project constants
 
 # ---------------------------------------------------------------------------
-# Vocabulary
+# Vocabulary — printable ASCII (option A)
 # ---------------------------------------------------------------------------
 
-CONTROL  = ["[PAD]", "[WIN]", "[DRAW]", "[LOSS]", "[GAME_END]"]
-PIECES   = ["N", "B", "R", "Q", "K"]
-FILES    = ["a", "b", "c", "d", "e", "f", "g", "h"]
-RANKS    = ["1", "2", "3", "4", "5", "6", "7", "8"]
-SPECIALS = ["O-O-O", "O-O", "x", "+", "#", "[PROMOTION]"]
+# printable ASCII: space (32) to tilde (126) = 95 characters
+VOCAB      = [chr(i) for i in range(32, 127)]
+UNK_CHAR   = "\x00"   # maps to id 0 for unknown characters
+TOKEN2ID   = {c: i + 1 for i, c in enumerate(VOCAB)}  # ids 1-95
+TOKEN2ID[UNK_CHAR] = 0
+ID2TOKEN   = {i: c for c, i in TOKEN2ID.items()}
+VOCAB_SIZE = 96   # 95 printable ASCII + 1 UNK
 
-VOCAB    = CONTROL + PIECES + FILES + RANKS + SPECIALS
-assert len(VOCAB) == 32
-
-TOKEN2ID = {tok: i for i, tok in enumerate(VOCAB)}
-ID2TOKEN = {i: tok for tok, i in TOKEN2ID.items()}
-VOCAB_SIZE = 32
-
-PAD_ID       = TOKEN2ID["[PAD]"]
-WIN_ID       = TOKEN2ID["[WIN]"]
-DRAW_ID      = TOKEN2ID["[DRAW]"]
-LOSS_ID      = TOKEN2ID["[LOSS]"]
-GAME_END_ID  = TOKEN2ID["[GAME_END]"]
-PROMOTION_ID = TOKEN2ID["[PROMOTION]"]
+PAD_ID     = TOKEN2ID[" "]   # space as padding — blends naturally into text
+UNK_ID     = 0
 
 # ---------------------------------------------------------------------------
 # Sequence
 # ---------------------------------------------------------------------------
 
-BLOCK_SIZE  = 512
-HEADER_LEN  = 1   # [WIN | DRAW | LOSS]
+BLOCK_SIZE = 1024
+HEADER_LEN = 0    # no special header tokens — header is part of the text
+
+# ---------------------------------------------------------------------------
+# Curriculum phases
+# ---------------------------------------------------------------------------
+
+PHASES = {
+    1: {"elo_min": 1000, "elo_max": 1600, "max_moves": 10},
+    2: {"elo_min": 1000, "elo_max": 2000, "max_moves": 20},
+    3: {"elo_min": 1000, "elo_max": 2400, "max_moves": 40},
+    4: {"elo_min": 1000, "elo_max": 9999, "max_moves": 999},
+    5: {"elo_min": 2000, "elo_max": 9999, "max_moves": 999},
+}
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+N_EMBD   = 384
+N_LAYER  = 6
+N_HEAD   = 6
+DROPOUT  = 0.1
 
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
 
-MIN_ELO     = 1200
-MIN_MOVES   = 10
+MIN_ELO   = 1000
+MIN_MOVES = 10
