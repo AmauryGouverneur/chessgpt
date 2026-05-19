@@ -25,3 +25,4 @@ wandb/
 
 # OS
 .DS_Store
+runs/

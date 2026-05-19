@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from config import PAD_ID
+from config import VOCAB_SIZE, BLOCK_SIZE, PAD_ID
 
 
 # ---------------------------------------------------------------------------
@@ -13,8 +13,8 @@ from config import PAD_ID
 
 @dataclass
 class ChessGPTConfig:
-    vocab_size: int   = 32
-    block_size: int   = 256
+    vocab_size: int   = VOCAB_SIZE
+    block_size: int   = BLOCK_SIZE
     n_embd:     int   = 384
     n_layer:    int   = 6
     n_head:     int   = 6

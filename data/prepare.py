@@ -4,7 +4,7 @@ prepare.py — filter and tokenize Lichess PGN games into curriculum phases.
 
 Usage:
     python data/prepare.py \
-        --input data/raw/lichess_db_standard_rated_2025-01.pgn.zst \
+        --input data/raw/lichess_mini.pgn.zst \
         --output-dir data/processed/ \
         --debug
 """
@@ -12,9 +12,12 @@ Usage:
 import argparse
 import re
 import os
+import sys
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Iterator
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import zstandard as zstd
 import pyarrow as pa
@@ -62,13 +65,9 @@ def encode(text: str) -> list[int]:
 # ---------------------------------------------------------------------------
 
 def truncate_moves(moves_str: str, max_moves: int) -> str:
-    """
-    Truncate a move string to at most max_moves full moves.
-    e.g. max_moves=3: "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4" -> "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6"
-    """
-    # split into tokens, find move number markers
-    tokens  = moves_str.split()
-    result  = []
+    """Truncate a move string to at most max_moves full moves."""
+    tokens     = moves_str.split()
+    result     = []
     move_count = 0
 
     for token in tokens:
@@ -91,13 +90,16 @@ def build_game_text(
 ) -> str:
     """
     Build the full text representation of a game.
-    Format: "WhiteElo=XXXX BlackElo=XXXX Result=X-X 1. e4 e5 2. Nf3 ..."
+    Format: "WhiteElo=XXXX BlackElo=XXXX Result=X 1. e4 e5 2. Nf3 ..."
     """
-    moves_san = re.sub(r'\{[^}]*\}', '', moves_str)  # strip annotations
-    moves_san = moves_san.strip()
-    # remove result token at end if present
+    # strip inline annotations
+    moves_san = re.sub(r'\{[^}]*\}', '', moves_str)
+    # strip black move numbers e.g. "1..." "2..."
+    moves_san = re.sub(r'\d+\.\.\.', '', moves_san)
+    # normalize spaces
+    moves_san = re.sub(r'\s+', ' ', moves_san).strip()
+    # strip result token at end
     for r in ("1-0", "0-1", "1/2-1/2", "*"):
-        moves_san = moves_san.rstrip()
         if moves_san.endswith(r):
             moves_san = moves_san[:-len(r)].rstrip()
 
@@ -107,7 +109,6 @@ def build_game_text(
 
 
 def count_full_moves(moves_str: str) -> int:
-    """Count the number of full moves (move number markers) in a move string."""
     return len(re.findall(r'\d+\.(?!\d)', moves_str))
 
 
@@ -180,12 +181,11 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # one parquet writer per phase
     schema = pa.schema([
         ("white_elo", pa.int16()),
         ("black_elo", pa.int16()),
-        ("n_chars",   pa.int16()),
-        ("text",      pa.string()),
+        ("n_tokens",  pa.int16()),
+        ("input_ids", pa.list_(pa.int8())),
     ])
 
     writers = {
@@ -195,8 +195,8 @@ def main() -> None:
         for phase in PHASES
     }
 
-    rows    = {phase: [] for phase in PHASES}
-    stats   = {
+    rows  = {phase: [] for phase in PHASES}
+    stats = {
         "total": 0, "abandoned": 0, "not_classical": 0,
         "low_elo": 0, "too_short": 0, "passed": 0
     }
@@ -207,30 +207,26 @@ def main() -> None:
         writers[phase].write_table(pa.table({
             "white_elo": pa.array([r["white_elo"] for r in rows[phase]], type=pa.int16()),
             "black_elo": pa.array([r["black_elo"] for r in rows[phase]], type=pa.int16()),
-            "n_chars":   pa.array([r["n_chars"]   for r in rows[phase]], type=pa.int16()),
-            "text":      pa.array([r["text"]       for r in rows[phase]], type=pa.string()),
+            "n_tokens":  pa.array([r["n_tokens"]  for r in rows[phase]], type=pa.int16()),
+            "input_ids": pa.array([r["input_ids"] for r in rows[phase]],
+                                  type=pa.list_(pa.int8())),
         }))
         rows[phase] = []
 
     for raw in stream_games(args.input):
         stats["total"] += 1
 
-        tc       = raw.headers.get("TimeControl", "")
-        welo     = parse_elo(raw.headers.get("WhiteElo", "0"))
-        belo     = parse_elo(raw.headers.get("BlackElo", "0"))
-        result   = parse_result(raw.headers.get("Result", ""))
-        n_moves  = count_full_moves(raw.moves_str)
+        tc      = raw.headers.get("TimeControl", "")
+        welo    = parse_elo(raw.headers.get("WhiteElo", "0"))
+        belo    = parse_elo(raw.headers.get("BlackElo", "0"))
+        result  = parse_result(raw.headers.get("Result", ""))
+        n_moves = count_full_moves(raw.moves_str)
 
-        if n_moves < 2:
-            stats["abandoned"] += 1; continue
-        if not is_classical(tc):
-            stats["not_classical"] += 1; continue
-        if welo < 1000 or belo < 1000:
-            stats["low_elo"] += 1; continue
-        if n_moves < 10:
-            stats["too_short"] += 1; continue
-        if result is None:
-            continue
+        if n_moves < 2:            stats["abandoned"]     += 1; continue
+        if not is_classical(tc):   stats["not_classical"] += 1; continue
+        if welo < 1000 or belo < 1000: stats["low_elo"]   += 1; continue
+        if n_moves < 10:           stats["too_short"]      += 1; continue
+        if result is None:                                        continue
 
         stats["passed"] += 1
         min_elo = min(welo, belo)
@@ -240,20 +236,22 @@ def main() -> None:
             if min_elo < cfg["elo_min"] or max_elo > cfg["elo_max"]:
                 continue
 
-            text    = build_game_text(welo, belo, result,
-                                      raw.moves_str, cfg["max_moves"])
-            n_chars = len(text)
+            text      = build_game_text(welo, belo, result,
+                                        raw.moves_str, cfg["max_moves"])
+            input_ids = encode(text)
+            n_tokens  = len(input_ids)
 
             if args.debug:
                 print(f"\n--- Phase {phase} | W:{welo} B:{belo} R:{result} ---")
-                print(f"  text    : {text[:100]}...")
-                print(f"  n_chars : {n_chars}")
+                print(f"  text     : {text[:100]}...")
+                print(f"  n_tokens : {n_tokens}")
+                print(f"  ids[:8]  : {input_ids[:8]}")
 
             rows[phase].append({
                 "white_elo": welo,
                 "black_elo": belo,
-                "n_chars":   min(n_chars, 32767),
-                "text":      text,
+                "n_tokens":  min(n_tokens, 32767),
+                "input_ids": input_ids,
             })
 
             if len(rows[phase]) >= 1000:
@@ -262,7 +260,6 @@ def main() -> None:
         if args.debug and stats["passed"] >= 20:
             break
 
-    # flush remaining
     for phase in PHASES:
         flush(phase)
         writers[phase].close()
@@ -279,7 +276,7 @@ def main() -> None:
         path = output_dir / f"dataset_phase{phase}.parquet"
         if path.exists():
             size = path.stat().st_size / 1e6
-            print(f"  Phase {phase}: {path.name} ({size:.0f} MB)")
+            print(f"  Phase {phase}: {path.name} ({size:.1f} MB)")
     print(f"\nVocab size: {VOCAB_SIZE}")
 
 
