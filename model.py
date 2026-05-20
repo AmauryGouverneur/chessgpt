@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from config import VOCAB_SIZE, BLOCK_SIZE, PAD_ID
+from config import VOCAB_SIZE, BLOCK_SIZE, PAD_ID, N_EMBD, N_LAYER, N_HEAD, DROPOUT, FLASH
 
 
 # ---------------------------------------------------------------------------
@@ -13,12 +13,13 @@ from config import VOCAB_SIZE, BLOCK_SIZE, PAD_ID
 
 @dataclass
 class ChessGPTConfig:
-    vocab_size: int   = VOCAB_SIZE
-    block_size: int   = BLOCK_SIZE
-    n_embd:     int   = 384
-    n_layer:    int   = 6
-    n_head:     int   = 6
-    dropout:    float = 0.1
+    vocab_size:          int   = VOCAB_SIZE
+    block_size:          int   = BLOCK_SIZE
+    n_embd:              int   = N_EMBD
+    n_layer:             int   = N_LAYER
+    n_head:              int   = N_HEAD
+    dropout:             float = DROPOUT
+    use_flash_attention: bool  = FLASH
 
     @classmethod
     def debug(cls) -> "ChessGPTConfig":
@@ -98,12 +99,15 @@ def apply_rope(
 class AttentionHead(nn.Module):
     def __init__(self, config: ChessGPTConfig):
         super().__init__()
-        self.dropout = nn.Dropout(config.dropout)
-        self.tril: torch.Tensor
-        self.register_buffer(
-            "tril",
-            torch.tril(torch.ones(config.block_size, config.block_size)),
-        )
+        self.dropout   = nn.Dropout(config.dropout)
+        self.use_flash = config.use_flash_attention
+
+        if not self.use_flash:
+            self.tril: torch.Tensor
+            self.register_buffer(
+                "tril",
+                torch.tril(torch.ones(config.block_size, config.block_size)),
+            )
 
     def forward(
         self,
@@ -111,6 +115,14 @@ class AttentionHead(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:
+        if self.use_flash:
+            return F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=True,
+            )
+        # standard attention
         T, head_size = q.shape[-2], q.shape[-1]
         wei = q @ k.transpose(-2, -1) * head_size ** -0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
