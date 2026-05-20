@@ -4,7 +4,8 @@ train.py — Training loop for ChessGPT.
 Usage:
     python train.py --debug
     python train.py --mac
-    python train.py
+    python train.py --phase 1
+    python train.py --phase 2 --resume runs/run_XXXXX/checkpoints/best.pt
 """
 
 import argparse
@@ -21,6 +22,7 @@ from tqdm import tqdm
 
 from data.dataset import get_dataloader
 from model import ChessGPT, ChessGPTConfig
+from config import PHASES, BLOCK_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -84,9 +86,9 @@ def evaluate(
 # Run directory
 # ---------------------------------------------------------------------------
 
-def make_run_dir(base: str = "runs") -> Path:
+def make_run_dir(phase: int, base: str = "runs") -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir   = Path(base) / f"run_{timestamp}"
+    run_dir   = Path(base) / f"phase{phase}_run_{timestamp}"
     (run_dir / "checkpoints").mkdir(parents=True)
     return run_dir
 
@@ -101,7 +103,6 @@ def save_config(run_dir: Path, config: ChessGPTConfig, args: argparse.Namespace)
             "n_head":      config.n_head,
             "dropout":     config.dropout,
         }, f, indent=2)
-
     with open(run_dir / "args.json", "w") as f:
         json.dump(vars(args), f, indent=2)
 
@@ -109,6 +110,20 @@ def save_config(run_dir: Path, config: ChessGPTConfig, args: argparse.Namespace)
 def log_metric(run_dir: Path, record: dict) -> None:
     with open(run_dir / "metrics.jsonl", "a") as f:
         f.write(json.dumps(record) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Phase config
+# ---------------------------------------------------------------------------
+
+# steps, warmup, batch_size per phase
+PHASE_TRAIN_CONFIG = {
+    1: {"max_steps": 50_000,  "warmup_steps": 1_000, "batch_size": 64, "lr": 3e-4},
+    2: {"max_steps": 100_000, "warmup_steps": 2_000, "batch_size": 64, "lr": 2e-4},
+    3: {"max_steps": 150_000, "warmup_steps": 2_000, "batch_size": 64, "lr": 1e-4},
+    4: {"max_steps": 200_000, "warmup_steps": 2_000, "batch_size": 64, "lr": 1e-4},
+    5: {"max_steps": 50_000,  "warmup_steps": 1_000, "batch_size": 64, "lr": 5e-5},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +143,8 @@ def train(args: argparse.Namespace) -> None:
         save_interval = 10
         batch_size    = 4
         learning_rate = 3e-4
-        data_path     = args.data or "data/processed/dataset_mini_moves.parquet"
+        data_path     = args.data or "data/processed/dataset_phase1.parquet"
+        phase         = 0
 
     elif args.mac:
         config        = ChessGPTConfig()
@@ -138,23 +154,27 @@ def train(args: argparse.Namespace) -> None:
         save_interval = 500
         batch_size    = 16
         learning_rate = 3e-4
-        data_path     = args.data or "data/processed/dataset_moves.parquet"
+        data_path     = args.data or "data/processed/dataset_phase1.parquet"
+        phase         = args.phase
 
     else:
+        phase         = args.phase
+        cfg           = PHASE_TRAIN_CONFIG[phase]
         config        = ChessGPTConfig()
-        max_steps     = args.max_steps
-        warmup_steps  = args.warmup_steps
+        max_steps     = args.max_steps or cfg["max_steps"]
+        warmup_steps  = args.warmup_steps or cfg["warmup_steps"]
         eval_interval = args.eval_interval
         save_interval = args.save_interval
-        batch_size    = args.batch_size
-        learning_rate = args.lr
-        data_path     = args.data or "data/processed/dataset_moves.parquet"
+        batch_size    = args.batch_size or cfg["batch_size"]
+        learning_rate = args.lr or cfg["lr"]
+        data_path     = args.data or f"data/processed/dataset_phase{phase}.parquet"
 
     # ── run directory ─────────────────────────────────────────────────────
-    run_dir = make_run_dir()
+    run_dir = make_run_dir(phase)
     print(f"Run directory: {run_dir}")
     save_config(run_dir, config, args)
     print(f"Config: {config}")
+    print(f"Phase: {phase} | Data: {data_path}")
 
     # ── wandb ─────────────────────────────────────────────────────────────
     wandb.init(
@@ -162,6 +182,7 @@ def train(args: argparse.Namespace) -> None:
         name    = run_dir.name,
         dir     = str(run_dir),
         config  = {
+            "phase":         phase,
             "vocab_size":    config.vocab_size,
             "block_size":    config.block_size,
             "n_embd":        config.n_embd,
@@ -188,8 +209,17 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
-    # ── model ─────────────────────────────────────────────────────────────
-    model = ChessGPT(config).to(device)
+    # ── model — init or resume ────────────────────────────────────────────
+    if args.resume:
+        print(f"Resuming from {args.resume}")
+        ckpt      = torch.load(args.resume, map_location=device, weights_only=False)
+        model     = ChessGPT(ckpt["config"]).to(device)
+        model.load_state_dict(ckpt["model"])
+        start_step = ckpt["step"]
+        print(f"Resumed from step {start_step}")
+    else:
+        model      = ChessGPT(config).to(device)
+        start_step = 0
 
     # ── optimizer + scheduler ─────────────────────────────────────────────
     optimizer = AdamW(
@@ -200,13 +230,18 @@ def train(args: argparse.Namespace) -> None:
     )
     scheduler = get_lr_scheduler(optimizer, warmup_steps, max_steps)
 
+    # fast-forward scheduler if resuming
+    if args.resume and start_step > 0:
+        for _ in range(start_step):
+            scheduler.step()
+
     # ── training loop ─────────────────────────────────────────────────────
     best_val_loss = float("inf")
     val_loss      = float("inf")
-    step          = 0
+    step          = start_step
     train_iter    = iter(train_loader)
 
-    pbar = tqdm(total=max_steps, desc="Training")
+    pbar = tqdm(total=max_steps, initial=start_step, desc=f"Phase {phase}")
 
     while step < max_steps:
         try:
@@ -234,7 +269,6 @@ def train(args: argparse.Namespace) -> None:
             "lr":    f"{cur_lr:.2e}",
         })
 
-        # log train loss every step to wandb
         wandb.log({"train_loss": loss.item(), "lr": cur_lr}, step=step)
 
         # ── eval ──────────────────────────────────────────────────────────
@@ -293,12 +327,15 @@ def main() -> None:
     parser.add_argument("--data",          type=str,   default=None)
     parser.add_argument("--debug",         action="store_true")
     parser.add_argument("--mac",           action="store_true")
-    parser.add_argument("--max-steps",     type=int,   default=10_000)
-    parser.add_argument("--warmup-steps",  type=int,   default=200)
-    parser.add_argument("--eval-interval", type=int,   default=200)
-    parser.add_argument("--save-interval", type=int,   default=1_000)
-    parser.add_argument("--batch-size",    type=int,   default=64)
-    parser.add_argument("--lr",            type=float, default=3e-4)
+    parser.add_argument("--phase",         type=int,   default=1)
+    parser.add_argument("--resume",        type=str,   default=None,
+                        help="Path to checkpoint to resume from")
+    parser.add_argument("--max-steps",     type=int,   default=None)
+    parser.add_argument("--warmup-steps",  type=int,   default=None)
+    parser.add_argument("--eval-interval", type=int,   default=500)
+    parser.add_argument("--save-interval", type=int,   default=5_000)
+    parser.add_argument("--batch-size",    type=int,   default=None)
+    parser.add_argument("--lr",            type=float, default=None)
     args = parser.parse_args()
     train(args)
 
