@@ -15,7 +15,7 @@ import os
 import sys
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Iterator, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -47,7 +47,7 @@ def parse_elo(val: str) -> int:
         return 0
 
 
-def parse_result(val: str) -> str | None:
+def parse_result(val: str) -> Optional[str]:
     return {"1-0": "1-0", "0-1": "0-1", "1/2-1/2": "1/2-1/2"}.get(val)
 
 
