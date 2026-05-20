@@ -19,7 +19,7 @@ UNK_ID     = 0
 # Sequence
 # ---------------------------------------------------------------------------
 
-BLOCK_SIZE = 1024
+BLOCK_SIZE = 512
 HEADER_LEN = 0    # no special header tokens — header is part of the text
 
 # ---------------------------------------------------------------------------
