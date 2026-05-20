@@ -15,7 +15,7 @@ import os
 import sys
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from typing import Iterator, Optional, List
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -55,7 +55,7 @@ def parse_result(val: str) -> Optional[str]:
 # Text encoding
 # ---------------------------------------------------------------------------
 
-def encode(text: str) -> list[int]:
+def encode(text: str) -> List[int]:
     """Encode a string to token ids using the ASCII vocabulary."""
     return [TOKEN2ID.get(c, UNK_ID) for c in text]
 
